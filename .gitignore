@@ -1,0 +1,15 @@
+# CMake build output
+/build/
+/cmake-build-*/
+
+# Editor and local environment files
+.cache/
+.clangd/
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local test/install staging
+/stage/
+/install/
