@@ -15,11 +15,13 @@
 #include <deque>
 #include <fcntl.h>
 #include <mutex>
+#include <random>
 #include <regex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <vector>
 #include <zlib.h>
@@ -49,6 +51,7 @@ public:
         if (burstMode) { rates={16e6,40e6,80e6}; sampleRate=16e6; }
         fd = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
         if (fd < 0) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+        if (ioctl(fd, TIOCEXCL) != 0) { ::close(fd); fd=-1; throw std::runtime_error("cannot exclusively open " + path + ": " + std::strerror(errno)); }
         termios tio{};
         if (tcgetattr(fd, &tio) == 0) {
             cfmakeraw(&tio);
@@ -58,10 +61,12 @@ public:
             tcsetattr(fd, TCSANOW, &tio);
         }
         try {
+            resync();
             info = command("INFO");
             caps = command("CAPS");
             parseLimits(command("LIMITS?"));
             parseRange(command("RANGE?"));
+            if (burstMode) { std::lock_guard<std::mutex> l(controlMutex); expectOk(commandLocked("BANDWIDTH 0")); bandwidth=bwMax*1e6; }
             setFrequency(SOAPY_SDR_RX, 0, frequency);
         } catch (...) { ::close(fd); fd = -1; throw; }
     }
@@ -132,7 +137,9 @@ public:
         std::unique_lock<std::mutex> l(fifoMutex); while(fifo.size()<2 && workerRunning) { if(timeoutUs==0) return SOAPY_SDR_TIMEOUT; if(fifoCv.wait_until(l,deadline)==std::cv_status::timeout && fifo.size()<2) return SOAPY_SDR_TIMEOUT; }
         if(fifo.empty()) return workerRunning?SOAPY_SDR_TIMEOUT:SOAPY_SDR_STREAM_ERROR;
         size_t bytes=n*2; std::vector<uint8_t> raw(std::min(bytes,fifo.size())); for(auto &x:raw){x=fifo.front();fifo.pop_front();} got=raw.size()/2;
-        if(st->format==SOAPY_SDR_CS8) std::memcpy(buffs[0],raw.data(),got*2); else {float *out=static_cast<float*>(buffs[0]); for(size_t i=0;i<got;i++){out[2*i]=raw[2*i]/128.0f;out[2*i+1]=raw[2*i+1]/128.0f;}}
+        // ESP-SDR's raw convention is LO - RF. Soapy/Gqrx convention is
+        // increasing RF on positive frequency; conjugate I+jQ here.
+        if(st->format==SOAPY_SDR_CS8) { auto *out=static_cast<int8_t*>(buffs[0]); for(size_t i=0;i<got;i++){out[2*i]=static_cast<int8_t>(raw[2*i]);out[2*i+1]=static_cast<int8_t>(-static_cast<int>(static_cast<int8_t>(raw[2*i+1]))); } } else {float *out=static_cast<float*>(buffs[0]); for(size_t i=0;i<got;i++){out[2*i]=static_cast<int8_t>(raw[2*i])/128.0f;out[2*i+1]=-static_cast<int8_t>(raw[2*i+1])/128.0f;}}
         return (int)got;
     }
 
@@ -144,6 +151,15 @@ private:
     void selectIqRate(double requested) { auto it=std::min_element(rates.begin(),rates.end(),[requested](double a,double b){return std::abs(a-requested)<std::abs(b-requested);}); sampleRate=*it; if(*it==625000.0){iqRateCode=1;iqDecimation=64;} else if(*it==312500.0){iqRateCode=0;iqDecimation=256;} else if(*it==250000.0){iqRateCode=6;iqDecimation=64;} else if(*it==125000.0){iqRateCode=6;iqDecimation=128;} else if(*it==62500.0){iqRateCode=6;iqDecimation=256;} else if(*it==31250.0){iqRateCode=6;iqDecimation=512;} else {iqRateCode=6;iqDecimation=1024;} }
     static void expectOk(const std::string &s) { if(s.rfind("OK",0)!=0) throw std::runtime_error("ESP-SDR: "+s); }
     std::string command(const std::string &s) { std::lock_guard<std::mutex> l(controlMutex); return commandLocked(s); }
+    void resync() {
+        tcflush(fd,TCIOFLUSH);
+        const uint64_t nonce=static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^ static_cast<uint64_t>(getpid());
+        const std::string x="\nSYNC "+std::to_string(nonce)+"\n";
+        if(::write(fd,x.data(),x.size())!=(ssize_t)x.size()) throw std::runtime_error("ESP-SDR resync write failed");
+        const std::string wanted="SYNC "+std::to_string(nonce);
+        for(unsigned i=0;i<16;i++) if(readLine()==wanted) return;
+        throw std::runtime_error("ESP-SDR synchronization failed");
+    }
     std::string commandLocked(const std::string &s) { std::string x=s+"\n"; if(::write(fd,x.data(),x.size())!=(ssize_t)x.size()) throw std::runtime_error("ESP-SDR write failed"); return readLine(); }
     std::string readLine() { std::string s; char c; for(;;){ssize_t n=::read(fd,&c,1); if(n==1){if(c=='\n') return s; if(c!='\r') s+=c; if(s.size()>512) throw std::runtime_error("ESP-SDR line too long");} else if(n<0 && errno!=EINTR) throw std::runtime_error("ESP-SDR read failed"); else if(n==0) throw std::runtime_error("ESP-SDR timeout/disconnect");} }
     void readExact(uint8_t *p,size_t n){while(n){ssize_t k=::read(fd,p,n);if(k>0){p+=k;n-=k;}else if(k<0&&errno==EINTR)continue;else throw std::runtime_error("ESP-SDR payload read failed");}}

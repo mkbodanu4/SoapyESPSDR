@@ -160,3 +160,27 @@ ls -l /dev/ttyACM*
 Install a udev rule for Espressif VID `303a`, PID `1001` if permissions prevent
 access. Use IQS mode at 250 kS/s or lower for stable continuous data; use burst
 mode only when the wider waterfall is worth the gaps.
+
+The driver also uses protocol `SYNC` during startup, takes exclusive ownership
+of the serial device, validates IQS and CAP16 CRCs, and conjugates raw ESP32-S3
+`LO - RF` samples to match the positive-frequency convention expected by
+SoapySDR and Gqrx.
+
+## Inspiration and related projects
+
+This driver builds on the reverse-engineering and host-side work in:
+
+- [ESPARGOS/esp-sdr](https://github.com/ESPARGOS/esp-sdr) — protocol-6 firmware,
+  ESP32-family receiver controls, burst capture, IQS decimation, and CRC-framed
+  serial transport.
+- [eSpDRmini](https://github.com/kingjamez/eSpDRmini) — ESP32-S3 snapshot
+  viewer, gain/AGC handling, spectrum-oriented burst acquisition, IQ
+  orientation handling, and practical USB throughput measurements.
+- [eSpDR](https://github.com/h0m3us3r/eSpDR) — original ESP32-S3 RF sample-dump
+  reverse engineering and the FPGA-based design capable of true wideband
+  continuous streaming.
+
+The related projects establish the practical boundary between wide but
+discontinuous snapshots over native USB and lower-rate continuous IQ suitable
+for demodulation. Their protocol and hardware documentation should be
+consulted when changing firmware assumptions or extending supported modes.
